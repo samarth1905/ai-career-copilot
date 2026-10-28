@@ -1,0 +1,25 @@
+AI CAREER COPILOT - SETUP (Windows PowerShell)
+
+1) Create server\.env (NOT included for safety). Copy the example and put your NEW key in it:
+     cd server
+     Copy-Item .env.example .env
+     notepad .env
+
+2) Install dependencies (use npm.cmd if PowerShell blocks npm):
+     cd C:\Users\Asus\ai-career-copilot
+     npm.cmd install
+     cd server
+     npm.cmd install
+
+3) Check the retry logic and each model (one at a time, 90s timeout):
+     cd server
+     node --test geminiRetry.test.mjs
+     node diag-model.mjs gemini-3.8-flash 90
+     node diag-model.mjs gemini-3.5-flash-lite 90
+
+4) Run (two terminals):
+     Terminal 1:  cd C:\Users\Asus\ai-career-copilot\server ; npm.cmd run dev
+     Terminal 2:  cd C:\Users\Asus\ai-career-copilot ; npm.cmd run dev
+
+5) Open http://localhost:5173
+   Health check: Invoke-RestMethod http://localhost:3001/api/health

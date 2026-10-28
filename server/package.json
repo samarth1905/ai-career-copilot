@@ -1,0 +1,17 @@
+{
+  "name": "ai-career-copilot-server",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "test:gemini": "node test-gemini.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "express-rate-limit": "latest"
+  }
+}

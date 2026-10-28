@@ -1,142 +1,165 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const initialTasks = [
-  { id: 1, title: "Learn JavaScript fundamentals", category: "Frontend", done: true },
-  { id: 2, title: "Build your first React component", category: "Frontend", done: true },
-  { id: 3, title: "Understand REST APIs", category: "Backend", done: false },
-  { id: 4, title: "Create a Python API", category: "AI Engineering", done: false },
+const starterPrompts = [
+  "Create a 6-month cloud engineering roadmap for a beginner.",
+  "Quiz me on JavaScript and explain my mistakes.",
+  "Help me prepare for a software developer internship interview.",
 ];
 
-const roadmap = [
-  { week: "01–02", title: "Web foundations", detail: "HTML, CSS, JavaScript and Git", status: "Completed" },
-  { week: "03–05", title: "React & modern frontend", detail: "Components, props, state and routing", status: "In progress" },
-  { week: "06–09", title: "Python & backend APIs", detail: "Python, FastAPI, REST and SQL", status: "Upcoming" },
-  { week: "10–13", title: "AI application development", detail: "LLM APIs, prompts and structured output", status: "Upcoming" },
-  { week: "14–18", title: "Build an AI product", detail: "RAG, evaluation and project deployment", status: "Upcoming" },
-];
+function MessageContent({ text }) {
+  // Simple readable rendering for plain-text AI responses.
+  return <div className="message-content">{text.split("\n").map((line, index) => (
+    <span key={index}>{line || "\u00a0"}{index < text.split("\n").length - 1 && <br />}</span>
+  ))}</div>;
+}
 
-const skills = [
-  ["HTML, CSS & JavaScript", "Frontend"], ["React", "Frontend"],
-  ["Python", "Programming"], ["FastAPI & REST APIs", "Backend"],
-  ["SQL & Databases", "Data"], ["LLMs & RAG", "AI Engineering"],
-];
+// Slightly above the backend's total budget (GEMINI_BUDGET_MS, 75s by default) so the server's
+// clear error message normally arrives first and the page can never spin forever.
+const REQUEST_TIMEOUT_MS = 85000;
 
-const projects = [
-  ["AI Career Copilot", "Current project", "Build a career planning assistant."],
-  ["AI PDF Assistant", "Next project", "Ask questions about documents with cited answers."],
-  ["AI Shopping Assistant", "Portfolio project", "Add intelligent product discovery to an online store."],
-];
-
-function loadTasks() {
+async function postJSON(url, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const saved = localStorage.getItem("career-copilot-tasks");
-    if (!saved) return initialTasks;
-    const parsed = JSON.parse(saved);
-    return Array.isArray(parsed) ? parsed : initialTasks;
-  } catch {
-    return initialTasks;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      // The backend sends { error: { code, message } }; also accept a plain string.
+      const apiError = data?.error;
+      const message = typeof apiError === "string" ? apiError : apiError?.message;
+      throw new Error(message || `The backend did not answer correctly (HTTP ${response.status}). Check that it is running on port 3001 and look at its terminal.`);
+    }
+    return data;
+  } catch (err) {
+    if (err?.name === "AbortError") throw new Error("This is taking too long. Please try again in a minute.");
+    if (err instanceof TypeError) throw new Error("Couldn't reach the backend. Check that it is running on port 3001.");
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 export default function App() {
-  const [activeNav, setActiveNav] = useState("Overview");
-  const [tasks, setTasks] = useState(loadTasks);
+  const [activeTab, setActiveTab] = useState("coach");
+  const [messages, setMessages] = useState([
+    { role: "assistant", text: "Hey! I'm your AI Career Coach. Tell me your target role, current skills, or what you're stuck on. I'll help you make a practical next-step plan." },
+  ]);
   const [question, setQuestion] = useState("");
-  const [coachMessage, setCoachMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("checking");
+  const [targetRole, setTargetRole] = useState("Cloud Engineer");
+  const [level, setLevel] = useState("Beginner");
+  const [months, setMonths] = useState("6");
+  const [roadmap, setRoadmap] = useState("");
+  const [roadmapBusy, setRoadmapBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [slow, setSlow] = useState(false);
+  const bottomRef = useRef(null);
 
   useEffect(() => {
-    try {
-      localStorage.setItem("career-copilot-tasks", JSON.stringify(tasks));
-    } catch (error) {
-      console.error("Unable to save tasks:", error);
-    }
-  }, [tasks]);
+    fetch("/api/health")
+      .then((res) => res.ok ? res.json() : Promise.reject(new Error("Backend unavailable")))
+      .then(() => setStatus("online"))
+      .catch(() => setStatus("offline"));
+  }, []);
 
-  const completed = tasks.filter((task) => task.done).length;
-  const progress = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
 
-  function toggleTask(id) {
-    setTasks((current) => current.map((task) =>
-      task.id === id ? { ...task, done: !task.done } : task
-    ));
-  }
+  // After 15s of waiting, tell the user the AI service is slow instead of showing the same message forever.
+  useEffect(() => {
+    if (!busy) return undefined;
+    const timer = setTimeout(() => setSlow(true), 15000);
+    return () => clearTimeout(timer);
+  }, [busy]);
 
-  function askAssistant(event) {
-    event.preventDefault();
-    const value = question.trim();
-    if (!value) return;
-    setCoachMessage(`Your question: “${value}”\n\nThe AI service is not connected yet. We'll connect a secure backend and real AI model in Phase 3.`);
+  async function sendMessage(value = question) {
+    const prompt = value.trim();
+    if (!prompt || busy) return;
+    setError("");
     setQuestion("");
+    setMessages((current) => [...current, { role: "user", text: prompt }]);
+    setBusy(true);
+    try {
+      // Error bubbles are not part of the conversation, so they are not sent back to Gemini.
+      const history = messages.filter((m) => !m.isError).slice(-10).map(({ role, text }) => ({ role, text }));
+      const data = await postJSON("/api/chat", { message: prompt, history });
+      setMessages((current) => [...current, { role: "assistant", text: data.reply }]);
+    } catch (err) {
+      const message = err.message || "Something went wrong. Please try again.";
+      setError(message);
+      setMessages((current) => [...current, { role: "assistant", isError: true, text: `I couldn't get a response this time. ${message}` }]);
+    } finally {
+      setBusy(false);
+      setSlow(false);
+    }
   }
 
-  function RoadmapList() {
-    return <div className="roadmap-list">{roadmap.map((item, index) => (
-      <article className="roadmap-item" key={item.week}>
-        <div className={`roadmap-marker ${item.status === "Completed" ? "marker-done" : item.status === "In progress" ? "marker-current" : ""}`}>
-          {item.status === "Completed" ? "✓" : String(index + 1).padStart(2, "0")}
-        </div>
-        <div className="roadmap-details">
-          <div className="roadmap-meta">WEEK {item.week}</div>
-          <h3>{item.title}</h3><p>{item.detail}</p>
-        </div>
-        <span className={`status-pill ${item.status.toLowerCase().replace(" ", "-")}`}>{item.status}</span>
-      </article>
-    ))}</div>;
+  async function generateRoadmap(event) {
+    event.preventDefault();
+    setError("");
+    setRoadmap("");
+    setRoadmapBusy(true);
+    try {
+      const data = await postJSON("/api/roadmap", { targetRole, level, months: Number(months) });
+      setRoadmap(data.roadmap);
+    } catch (err) {
+      setError(err.message || "Could not generate a roadmap. Please try again.");
+    } finally {
+      setRoadmapBusy(false);
+    }
   }
 
-  function renderPage() {
-    if (activeNav === "Overview") return <>
-      <section className="welcome-row">
-        <div><div className="eyebrow"><span className="status-dot" /> YOUR CAREER JOURNEY STARTS HERE</div>
-          <h1>Build your future, <span>one skill at a time.</span></h1>
-          <p className="subtitle">Your personal space to learn, build projects, and prepare for your next opportunity.</p>
-        </div>
-        <button className="primary-button" onClick={() => setActiveNav("Learning Roadmap")}>Explore roadmap <span>↗</span></button>
-      </section>
-      <section className="hero-card">
-        <div className="hero-copy">
-          <div className="hero-tag"><span>✳</span> YOUR PERSONAL CAREER COPILOT</div>
-          <h2>Turn your ambition<br />into <span>real-world skills.</span></h2>
-          <p>Learn the right things, build meaningful projects, and track your progress toward becoming an AI engineer.</p>
-          <button className="hero-button" onClick={() => setActiveNav("Learning Roadmap")}>Continue learning <span>→</span></button>
-        </div>
-        <div className="hero-art" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="orbit orbit-three" /><div className="orbit-center">✳</div><div className="float-card float-top"><span>⌘</span><div><b>Build</b><small>Real projects</small></div></div><div className="float-card float-bottom"><span>↗</span><div><b>Grow</b><small>Every single day</small></div></div></div>
-      </section>
-      <section className="stats-grid">
-        <article className="stat-card"><div className="stat-top"><span>Learning progress</span><span className="stat-icon purple">◔</span></div><div className="stat-value">{progress}<small>%</small></div><div className="mini-progress"><span style={{ width: `${progress}%` }} /></div><p>{completed} of {tasks.length} starter tasks completed</p></article>
-        <article className="stat-card"><div className="stat-top"><span>Skills to develop</span><span className="stat-icon orange">◇</span></div><div className="stat-value">06</div><p>Frontend, backend, Python, AI, SQL, Git</p></article>
-        <article className="stat-card"><div className="stat-top"><span>Portfolio projects</span><span className="stat-icon green">▧</span></div><div className="stat-value">03</div><p>Build, publish, and explain your work</p></article>
-      </section>
-      <div className="content-grid">
-        <section className="panel roadmap-panel"><div className="panel-heading"><div><h2>Your learning roadmap</h2><p>A practical path from fundamentals to AI applications.</p></div><button className="text-button" onClick={() => setActiveNav("Learning Roadmap")}>View all ↗</button></div><RoadmapList /></section>
-        <section className="panel tasks-panel"><div className="panel-heading"><div><h2>Today's focus</h2><p>Small steps add up.</p></div><span className="today-icon">✦</span></div>
-          <div className="task-progress-label"><span>Starter checklist</span><strong>{completed}/{tasks.length}</strong></div><div className="mini-progress task-bar"><span style={{ width: `${progress}%` }} /></div>
-          <div className="task-list">{tasks.map((task) => <label className={`task-item ${task.done ? "task-done" : ""}`} key={task.id}><input type="checkbox" checked={task.done} onChange={() => toggleTask(task.id)} /><span className="custom-check">{task.done ? "✓" : ""}</span><span className="task-text"><strong>{task.title}</strong><small>{task.category}</small></span></label>)}</div>
-          <div className="encouragement"><span>✳</span><p><strong>Consistency beats intensity.</strong><br />Keep showing up, even for 30 minutes.</p></div>
-        </section>
-      </div>
-      <section className="assistant-banner"><div className="assistant-symbol">✳</div><div className="assistant-copy"><h2>Stuck on what to learn next?</h2><p>Your AI coach interface is ready. We'll connect it to a real AI model in Phase 3.</p></div><button className="primary-button" onClick={() => setActiveNav("AI Coach")}>Open AI Coach <span>→</span></button></section>
-    </>;
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><div className="brand-mark">CC</div><div><strong>Career Copilot</strong><small>YOUR NEXT CHAPTER</small></div></div>
+        <div className="profile-card"><div className="avatar">S</div><div><strong>Career workspace</strong><small>Build skills. Get hired.</small></div></div>
+        <p className="nav-label">WORKSPACE</p>
+        <button className={`nav-item ${activeTab === "coach" ? "active" : ""}`} onClick={() => setActiveTab("coach")}><span>✦</span> AI Career Coach</button>
+        <button className={`nav-item ${activeTab === "roadmap" ? "active" : ""}`} onClick={() => setActiveTab("roadmap")}><span>↗</span> Roadmap Generator</button>
+        <div className="sidebar-bottom"><div className={`status-dot ${status}`} /><div><strong>{status === "online" ? "Backend connected" : status === "checking" ? "Checking backend…" : "Backend offline"}</strong><small>{status === "online" ? "Gemini endpoint available" : "Start the Node server"}</small></div></div>
+      </aside>
 
-    if (activeNav === "Learning Roadmap") return <section className="panel feature-page"><div className="panel-heading"><div><h2>Your learning roadmap</h2><p>A practical path from fundamentals to AI applications.</p></div></div><RoadmapList /></section>;
+      <main className="main-area">
+        <header className="topbar"><div><span className="eyebrow">AI-POWERED CAREER DEVELOPMENT</span><h1>{activeTab === "coach" ? "Your AI Career Coach" : "Personalized Roadmap"}</h1></div><div className="topbar-chip"><span className={`status-dot ${status}`} />{status === "online" ? "System online" : status === "checking" ? "Connecting…" : "Needs setup"}</div></header>
 
-    if (activeNav === "Skills") return <section className="panel feature-page"><div className="panel-heading"><div><h2>Skills to develop</h2><p>Learn each skill through practice and projects.</p></div></div><div className="feature-grid">{skills.map(([skill, category]) => <article className="feature-card" key={skill}><span className="roadmap-meta">{category}</span><h3>{skill}</h3><p>Learn the fundamentals and build a practical project.</p></article>)}</div></section>;
+        {error && <div className="error-banner" role="alert"><strong>Heads up:</strong> {error}</div>}
 
-    if (activeNav === "Projects") return <section className="panel feature-page"><div className="panel-heading"><div><h2>Portfolio projects</h2><p>Build, publish, and explain your work.</p></div></div><div className="feature-grid">{projects.map(([name, status, description]) => <article className="feature-card" key={name}><span className="roadmap-meta">{status}</span><h3>{name}</h3><p>{description}</p></article>)}</div></section>;
-
-    return <section className="panel feature-page"><div className="coach-content"><div className="assistant-symbol">✳</div><h2>AI Career Coach</h2><p>Ask a question about programming, AI, projects, or your learning roadmap. This prototype confirms your question; live AI answers will be added in Phase 3.</p><form className="assistant-form" onSubmit={askAssistant}><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="e.g. What should I learn in React first?" aria-label="Ask the career coach" /><button type="submit" aria-label="Submit question">→</button></form>{coachMessage && <pre className="coach-message">{coachMessage}</pre>}</div></section>;
-  }
-
-  const navItems = [["Overview", "◫"], ["Learning Roadmap", "▤"], ["Skills", "◇"], ["AI Coach", "✳"], ["Projects", "▧"]];
-
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <button className="brand brand-button" onClick={() => setActiveNav("Overview")}><span className="brand-mark">✳</span><span>career<span className="brand-light">copilot</span></span></button>
-      <div className="workspace-label">WORKSPACE</div>
-      <nav className="nav-list" aria-label="Main navigation">{navItems.map(([name, icon]) => <button key={name} className={`nav-item ${activeNav === name ? "active" : ""}`} onClick={() => setActiveNav(name)}><span className="nav-icon">{icon}</span>{name}{name === "AI Coach" && <span className="nav-badge">AI</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="goal-card"><div className="goal-icon">↗</div><p className="goal-label">YOUR CAREER GOAL</p><h3>AI Engineer</h3><p>Build skills. Ship projects. Get job-ready.</p><div className="goal-line"><span /></div><small>One step at a time</small></div><div className="profile"><div className="avatar">S</div><div><strong>Your workspace</strong><small>Career explorer</small></div><span className="profile-dots">···</span></div></div>
-    </aside>
-    <main className="main-content"><header className="topbar"><div className="breadcrumb">Workspace <span>/</span> {activeNav}</div><div className="topbar-right"><span className="streak">✦ Keep your streak going</span><div className="top-avatar">S</div></div></header><div className="page-content">{renderPage()}<footer className="footer"><span>✳ career<span className="brand-light">copilot</span></span><span>Made for your next chapter.</span></footer></div></main>
-  </div>;
+        {activeTab === "coach" ? (
+          <section className="coach-layout">
+            <div className="welcome-panel"><div className="sparkle">✦</div><div><span className="eyebrow">YOUR PERSONAL CAREER PARTNER</span><h2>Big goals. Clear next steps.</h2><p>Ask questions, practise interviews, learn technical concepts, or get a realistic plan for your target role.</p></div></div>
+            <div className="chat-panel">
+              <div className="chat-heading"><div><h2>Career chat</h2><p>Powered by Google Gemini through your secure backend</p></div><span className="live-pill"><i /> AI COACH</span></div>
+              <div className="messages" aria-live="polite">
+                {messages.map((message, index) => <div className={`message-row ${message.role}`} key={`${message.role}-${index}`}><div className="message-avatar">{message.role === "assistant" ? "✦" : "S"}</div><div className="message-bubble"><div className="message-author">{message.role === "assistant" ? "Career Copilot" : "You"}</div><MessageContent text={message.text} /></div></div>)}
+                {busy && <div className="message-row assistant"><div className="message-avatar">✦</div><div className="message-bubble"><div className="message-author">Career Copilot</div><div className="typing"><i /><i /><i /> {slow ? "Still working — the AI service is slow right now…" : "Thinking through your question…"}</div></div></div>}
+                <div ref={bottomRef} />
+              </div>
+              {messages.length < 3 && <div className="starter-prompts">{starterPrompts.map((prompt) => <button key={prompt} onClick={() => sendMessage(prompt)} disabled={busy}>{prompt}</button>)}</div>}
+              <form className="composer" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask about skills, jobs, interviews, or your learning plan…" rows={2} maxLength={4000} /><div className="composer-footer"><span>Enter to send · Shift + Enter for a new line</span><button type="submit" disabled={busy || !question.trim()}>{busy ? "Thinking…" : "Send message"} <span>↗</span></button></div></form>
+            </div>
+          </section>
+        ) : (
+          <section className="roadmap-layout">
+            <div className="roadmap-intro"><div className="sparkle">↗</div><span className="eyebrow">YOUR PLAN, YOUR PACE</span><h2>Turn your target role into a plan.</h2><p>Choose a role, your current level, and a timeframe. Gemini will create a practical learning roadmap with projects and checkpoints.</p></div>
+            <form className="roadmap-form" onSubmit={generateRoadmap}>
+              <label>Target role<input value={targetRole} onChange={(event) => setTargetRole(event.target.value)} required maxLength={100} placeholder="e.g. Cloud Engineer" /></label>
+              <div className="form-grid"><label>Current level<select value={level} onChange={(event) => setLevel(event.target.value)}><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></label><label>Timeframe<select value={months} onChange={(event) => setMonths(event.target.value)}><option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months</option><option value="8">8 months</option><option value="12">12 months</option></select></label></div>
+              <button className="generate-button" type="submit" disabled={roadmapBusy}>{roadmapBusy ? "Building your roadmap…" : "✦ Generate my roadmap"}</button>
+            </form>
+            {roadmap && <div className="roadmap-result"><div className="result-heading"><div><span className="eyebrow">GENERATED FOR YOU</span><h2>{targetRole} roadmap</h2></div><button className="copy-button" onClick={() => navigator.clipboard?.writeText(roadmap).catch(() => {})}>Copy plan</button></div><MessageContent text={roadmap} /></div>}
+          </section>
+        )}
+        <footer className="footer-note">AI can make mistakes. Verify important career, certification, and hiring information with official sources.</footer>
+      </main>
+    </div>
+  );
 }
